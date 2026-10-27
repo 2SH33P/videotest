@@ -1,0 +1,94 @@
+name: Render film
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "并行分片数 (1-20)"
+        default: "12"
+  push:
+    tags: ["v*"]
+
+env:
+  TOTAL_FRAMES: 5928
+
+jobs:
+  audio:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Synthesize soundtrack (pure code)
+        run: |
+          node audio.js
+          ffmpeg -y -loglevel error -i out/audio.wav -af loudnorm=I=-14:TP=-1.2:LRA=16 -ar 48000 out/master.wav
+      - uses: actions/upload-artifact@v4
+        with: { name: audio, path: out/, retention-days: 3 }
+      - id: m
+        run: |
+          S=${{ github.event.inputs.shards || '12' }}
+          echo "matrix=$(python3 -c "import json;print(json.dumps(list(range($S))))")" >> $GITHUB_OUTPUT
+          echo "n=$S" >> $GITHUB_OUTPUT
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+      n: ${{ steps.m.outputs.n }}
+
+  render:
+    needs: audio
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.audio.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: System deps (CJK fonts + ffmpeg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-cjk fonts-noto-cjk-extra fonts-liberation fonts-dejavu-core
+          fc-cache -f
+      - run: npm install --no-audit --no-fund && npx playwright install --with-deps chromium
+      - uses: actions/download-artifact@v4
+        with: { name: audio, path: out/ }
+      - name: Render frames
+        run: |
+          N=${{ needs.audio.outputs.n }}; I=${{ matrix.shard }}
+          PER=$(( (TOTAL_FRAMES+N-1)/N )); A=$(( I*PER )); B=$(( A+PER )); if (( B>TOTAL_FRAMES )); then B=$TOTAL_FRAMES; fi
+          echo "A=$A" >> $GITHUB_ENV
+          python3 -m http.server 8123 >/dev/null 2>&1 &
+          sleep 1
+          H=$(( (B-A+1)/2 ))
+          node render.js $A $((A+H)) & P1=$!
+          node render.js $((A+H)) $B & P2=$!
+          wait $P1; wait $P2
+          test $(ls frames | wc -l) -eq $((B-A))
+      - name: Encode segment
+        run: |
+          ffmpeg -y -loglevel error -framerate 24 -start_number $A -i frames/f%05d.jpg \
+            -c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p -g 48 seg.mp4
+          mv seg.mp4 seg_$(printf %03d ${{ matrix.shard }}).mp4
+      - uses: actions/upload-artifact@v4
+        with: { name: "seg-${{ matrix.shard }}", path: "seg_*.mp4", retention-days: 3 }
+
+  assemble:
+    needs: render
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - uses: actions/download-artifact@v4
+        with: { name: audio, path: out/ }
+      - uses: actions/download-artifact@v4
+        with: { pattern: "seg-*", path: segs/, merge-multiple: true }
+      - name: Concat + mux master audio
+        run: |
+          ls segs/seg_*.mp4 | sort | sed "s|^|file '$PWD/|;s|$|'|" > list.txt
+          cat list.txt
+          ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -i out/master.wav \
+            -map 0:v -map 1:a -c:v copy -c:a aac -b:a 256k -shortest -movflags +faststart film.mp4
+          ffprobe -v error -show_entries format=duration -of csv=p=0 film.mp4
+      - uses: actions/upload-artifact@v4
+        with: { name: "film-the-voice-without-a-throat", path: film.mp4, retention-days: 30 }
